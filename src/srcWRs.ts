@@ -1,12 +1,19 @@
 import * as events from "events";
 import * as request from "request-promise";
 import * as fs from 'fs';
+import * as Discord from "discord.js";
 
 const leaderboardCacheFile = 'leaderboard_cache.json';
 const game = "76rqjqd8"; // botw
 const srcApi = 'https://www.speedrun.com/api/v1/';
-const categoryWRMap = {};
 const wrEmitter = new events.EventEmitter();
+
+// save all leaderboards
+interface LeaderboardCache {
+    leaderboards: Leaderboard[],
+    // cache last runs to make sure to not miss any
+    lastRunIDs: string[],
+}
 
 interface Leaderboard {
     categoryId: string;
@@ -51,44 +58,72 @@ interface Run {
 }
 
 async function srcWRLoop() {
-    let oldRunIds: string[] = [];
     while(true) {
         // load cached leaderboard, if it doesn't exist, grab it fresh from src
-        let leaderboards = loadLeaderboardCache();
-        if (leaderboards == null) {
-            leaderboards = await updateCategories();
-            saveLeaderboardCache(leaderboards);
+        let leaderboardCache = await loadLeaderboardCache();
+        if (leaderboardCache == null) {
+            const leaderboards = await updateCategories();
+            leaderboardCache = {leaderboards: leaderboards, lastRunIDs: []};
+            await saveLeaderboardCache(leaderboardCache);
+            console.log('saved initial leaderboard');
         }
+        leaderboardCache.lastRunIDs = [];
+        console.log(`loaded cache with ${leaderboardCache.leaderboards.length} leaderboards!`);
         // grab newly submitted runs
-        let newRuns = await newVerifiedRuns(oldRunIds, leaderboards);
+        let newRuns = await newVerifiedRuns(leaderboardCache);
+        console.log(JSON.stringify(newRuns));
         newRuns.forEach(run => {
-            oldRunIds.unshift(run.id);
+            leaderboardCache.lastRunIDs.unshift(run.id);
             // announce new run
             wrEmitter.emit('newRun',run);
             // check if it's a new WR or the first run in that category
             if (run.leaderboard.wrRunTime == null || run.time < run.leaderboard.wrRunTime) {
                 run.leaderboard.wrRunTime = run.time;
                 run.leaderboard.wrRunId = run.id;
-                saveLeaderboardCache(leaderboards);
                 wrEmitter.emit('newWR',run);
             }
         });
         // limit to 30 elements
-        oldRunIds = oldRunIds.splice(0,30);
+        leaderboardCache.lastRunIDs = leaderboardCache.lastRunIDs.splice(0,30);
+        await saveLeaderboardCache(leaderboardCache);
         // sleep to wait for runs
         await sleep(30000);
     }
 }
 
-function loadLeaderboardCache(): Leaderboard[] | null {
-    if (!fs.existsSync(leaderboardCacheFile)) {
-        return null;
-    }
-    return JSON.parse(fs.readFileSync(leaderboardCacheFile, {encoding: 'utf-8'}));
+/**
+ * Load the leaderboard from cache file if it exists
+ */
+async function loadLeaderboardCache(): Promise<LeaderboardCache | null> {
+    return new Promise((resolve, reject) => {
+        try {
+            if (!fs.existsSync(leaderboardCacheFile)) {
+                resolve(null);
+            } else {
+                fs.readFile(leaderboardCacheFile, {encoding: 'utf-8'}, (err, data) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(JSON.parse(data));
+                    }
+                })
+            }
+        } catch(e) {
+            reject(e);
+        }
+    });
 }
 
-function saveLeaderboardCache(Leaderboard: Leaderboard[]) {
-    fs.writeFileSync(leaderboardCacheFile, JSON.stringify(Leaderboard), {encoding: 'utf-8'});
+async function saveLeaderboardCache(Leaderboard: LeaderboardCache): Promise<void> {
+    return new Promise((resolve, reject) => {
+        fs.writeFile(leaderboardCacheFile, JSON.stringify(Leaderboard), {encoding: 'utf-8'}, (err) => {
+            if (err) {
+                reject(err);
+            } else {
+                resolve();
+            }
+        });
+    });
 }
 
 /**
@@ -224,12 +259,13 @@ async function updateCategories(): Promise<Leaderboard[]> {
             leaderboard.wrRunId = leaderboardData.data.runs[0].run.id;
             leaderboard.wrRunTime = leaderboardData.data.runs[0].run.times.primary_t;
             // need to embed players for this debug log
+            console.log(`${i}/${leaderboards.length} `+formatLeaderboard(leaderboard));
             //console.log(`The WR in ${formatLeaderboard(leaderboard)} is ${leaderboardData.data.runs[0].run.times.primary} by ${leaderboardData.data.players.data[0].names.international}`);
         }
         // don't make too many requests
         await sleep(1000);
     }
-    saveLeaderboardCache(leaderboards);
+    await saveLeaderboardCache({leaderboards, lastRunIDs: []});
     return leaderboards;
 }
 
@@ -267,13 +303,13 @@ function variableCombinations(cat: Category): ValueVariable[][] {
     return combinations;
 }
 
-async function newVerifiedRuns(lastVerifiedIds: string[], leaderboards: Leaderboard[]): Promise<Run[]> {
+async function newVerifiedRuns(leaderboardCache: LeaderboardCache): Promise<Run[]> {
     const runData = await requestWithRetry(`https://www.speedrun.com/api/v1/runs?game=${game}&status=verified&direction=desc&orderby=verify-date&embed=players&max=30`, 3);
     const newRuns: Run[] = [];
     for(let i = 0;i<runData.data.length;i++) {
         let curRun = runData.data[i];
-        if (!lastVerifiedIds.includes(curRun.id)) {
-            newRuns.push(parseRun(curRun, leaderboards));
+        if (!leaderboardCache.lastRunIDs.includes(curRun.id)) {
+            newRuns.push(parseRun(curRun, leaderboardCache.leaderboards));
         } else {
             break;
         }
@@ -315,6 +351,28 @@ function parseRun(srcData: any, leaderboards: Leaderboard[]): Run {
         time: srcData.times.primary_t,
     }
 }
+
+
+async function formatSendRun(channel: Discord.TextChannel, info: Run): Promise<any> {
+    let category: string;
+    if (info.leaderboard.levelName) {
+        category = `${info.leaderboard.levelName} ${info.leaderboard.categoryName}`;
+    } else {
+        category = info.leaderboard.categoryName;
+    }
+    let subcategories = `${info.leaderboard.variables.map(v => v.valueName).join(', ')}`
+    return channel.send({
+        embed: {
+            title: `NEW World Record`,
+            url: `https://www.speedrun.com/run/${info.id}`,
+            color: 0xffcd2e,
+            description: `A new WR has been posted for ${formatLeaderboard(info.leaderboard)}`,
+            fields: [{name: "Runner", value: info.playerName}, {name:"Time", value: formatTime(info.time)}],
+        }
+    });
+}
+
+// helpers
 
 function formatLeaderboard(lb: Leaderboard): string {
     const varString = lb.variables.map(v => v.valueName).join(', ');
@@ -383,13 +441,32 @@ async function sleep(ms): Promise<void>{
     .map(lb => formatLeaderboard(lb));
 console.log(freeWRs);*/
 //console.log(loadLeaderboardCache().length)
-wrEmitter.on('newWR', (run: Run) => {
+/*wrEmitter.on('newWR', (run: Run) => {
     console.log('New WR:',run);
-});
+});*/
 /*wrEmitter.on('newRun', (run: Run) => {
     console.log('New run:',run);
 });*/
 srcWRLoop();
+//discordTest();
+
+/*async function discordTest() {
+    const client = new Discord.Client();
+    await client.login("insert token");
+    const channel = client.channels.get("insert id here") as Discord.TextChannel;
+    if (channel) {
+        wrEmitter.on('newWR', async (run: Run) => {
+            console.log('New WR:',run);
+            try {
+                await formatSendRun(channel, run);
+            } catch(e) {
+                console.log('error formatSendRun',e);
+            }
+        });
+    } else {
+        console.error('channel not found!');
+    }
+}*/
 
 module.exports = {
     srcWRLoop,
