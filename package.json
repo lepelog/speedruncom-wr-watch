@@ -10,8 +10,7 @@
     "discord.js": "^11.5.1",
     "events": "^3.0.0",
     "request": "^2.88.0",
-    "request-promise": "^4.2.4",
-    "typescript": "^3.6.4"
+    "request-promise": "^4.2.4"
   },
   "devDependencies": {},
   "scripts": {

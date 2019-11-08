@@ -1,21 +1,12 @@
 import * as events from "events";
 import * as request from "request-promise";
-import * as fs from 'fs';
 import * as Discord from "discord.js";
 
-const leaderboardCacheFile = 'leaderboard_cache.json';
 const gameID = "76rqjqd8"; // botw
 const srcApi = 'https://www.speedrun.com/api/v1/';
 const wrEmitter = new events.EventEmitter();
 
 const SRC_RUN_LINK_REGEX = /https:\/\/www.speedrun.com\/.+\/run\/([0-9a-z]+)/
-
-// save all leaderboards
-interface LeaderboardCache {
-    leaderboards: Leaderboard[],
-    // cache last runs to make sure to not miss any
-    lastRunIDs: string[],
-}
 
 interface Leaderboard {
     categoryId: string;
@@ -81,22 +72,26 @@ async function srcWRLoop(lastRunIDs?: string[]) {
     lastRunIDs = lastRunIDs || [];
     const game = await loadGame(gameID)
     while(true) {
-        // grab newly submitted runs
-        const newRuns = await newVerifiedRuns(game, lastRunIDs);
-        for(const run of newRuns) {
-            lastRunIDs.unshift(run.id);
-            // announce new run
-            wrEmitter.emit('newRun',run);
-            // check if it's a new WR or the first run in that category
-            const place = await checkRunPlaceOnLeaderboard(run);
-            if (place === 1) {
-                wrEmitter.emit('newWR',run);
+        try {
+            // grab newly submitted runs
+            const newRuns = await newVerifiedRuns(game, lastRunIDs);
+            for(const run of newRuns) {
+                lastRunIDs.unshift(run.id);
+                // announce new run
+                wrEmitter.emit('newRun',run);
+                // check if it's a new WR or the first run in that category
+                const place = await checkRunPlaceOnLeaderboard(run);
+                if (place === 1) {
+                    wrEmitter.emit('newWR',run);
+                }
             }
+            // limit to 30 elements
+            lastRunIDs = lastRunIDs.splice(0,30);
+            // sleep to wait for runs
+            await sleep(30000);
+        } catch(e) {
+            console.error('error during main loop, continuing',e);
         }
-        // limit to 30 elements
-        lastRunIDs = lastRunIDs.splice(0,30);
-        // sleep to wait for runs
-        await sleep(30000);
     }
 }
 
