@@ -4,9 +4,11 @@ import * as fs from 'fs';
 import * as Discord from "discord.js";
 
 const leaderboardCacheFile = 'leaderboard_cache.json';
-const game = "76rqjqd8"; // botw
+const gameID = "76rqjqd8"; // botw
 const srcApi = 'https://www.speedrun.com/api/v1/';
 const wrEmitter = new events.EventEmitter();
+
+const SRC_RUN_LINK_REGEX = /https:\/\/www.speedrun.com\/.+\/run\/([0-9a-z]+)/
 
 // save all leaderboards
 interface LeaderboardCache {
@@ -25,22 +27,32 @@ interface Leaderboard {
     wrRunTime: number | null;
 }
 
+interface Game {
+    abbreviation: string,
+    name: string,
+    id: string,
+    categories: Map<string, Category>,
+    levels: Map<string, Level>,
+    fullGameVariables: Map<string, Variable>,
+    levelVariables: Map<string, Variable>,
+}
+
 interface Level {
     levelId: string;
     levelName: string;
-    categories: Category[];
+    categories: Map<string, Category>;
 }
 
 interface Category {
     id: string;
     name: string;
-    variables: {[key: string]: Variable};
+    variables: Map<string, Variable>;
 }
 
 interface Variable {
     id: string;
     name: string;
-    values: {[key: string]: string},
+    values: Map<string, string>,
 }
 
 interface ValueVariable {
@@ -54,262 +66,141 @@ interface Run {
     id: string;
     time: number;
     playerName: string;
-    leaderboard: Leaderboard;
+    playerID: string,
+    game: string,
+    gameID: string,
+    gameAbbreviation: string,
+    level: string | null,
+    levelID: string | null,
+    category: string,
+    categoryID: string,
+    variables: ValueVariable[],
 }
 
-async function srcWRLoop() {
+async function srcWRLoop(lastRunIDs?: string[]) {
+    lastRunIDs = lastRunIDs || [];
+    const game = await loadGame(gameID)
     while(true) {
-        // load cached leaderboard, if it doesn't exist, grab it fresh from src
-        let leaderboardCache = await loadLeaderboardCache();
-        if (leaderboardCache == null) {
-            const leaderboards = await updateCategories();
-            leaderboardCache = {leaderboards: leaderboards, lastRunIDs: []};
-            await saveLeaderboardCache(leaderboardCache);
-            console.log('saved initial leaderboard');
-        }
-        leaderboardCache.lastRunIDs = [];
-        console.log(`loaded cache with ${leaderboardCache.leaderboards.length} leaderboards!`);
         // grab newly submitted runs
-        let newRuns = await newVerifiedRuns(leaderboardCache);
-        console.log(JSON.stringify(newRuns));
-        newRuns.forEach(run => {
-            leaderboardCache.lastRunIDs.unshift(run.id);
+        const newRuns = await newVerifiedRuns(game, lastRunIDs);
+        for(const run of newRuns) {
+            lastRunIDs.unshift(run.id);
             // announce new run
             wrEmitter.emit('newRun',run);
             // check if it's a new WR or the first run in that category
-            if (run.leaderboard.wrRunTime == null || run.time < run.leaderboard.wrRunTime) {
-                run.leaderboard.wrRunTime = run.time;
-                run.leaderboard.wrRunId = run.id;
+            const place = await checkRunPlaceOnLeaderboard(run);
+            if (place === 1) {
                 wrEmitter.emit('newWR',run);
             }
-        });
+        }
         // limit to 30 elements
-        leaderboardCache.lastRunIDs = leaderboardCache.lastRunIDs.splice(0,30);
-        await saveLeaderboardCache(leaderboardCache);
+        lastRunIDs = lastRunIDs.splice(0,30);
         // sleep to wait for runs
         await sleep(30000);
     }
 }
 
-/**
- * Load the leaderboard from cache file if it exists
- */
-async function loadLeaderboardCache(): Promise<LeaderboardCache | null> {
-    return new Promise((resolve, reject) => {
-        try {
-            if (!fs.existsSync(leaderboardCacheFile)) {
-                resolve(null);
-            } else {
-                fs.readFile(leaderboardCacheFile, {encoding: 'utf-8'}, (err, data) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(JSON.parse(data));
-                    }
-                })
-            }
-        } catch(e) {
-            reject(e);
-        }
-    });
-}
-
-async function saveLeaderboardCache(Leaderboard: LeaderboardCache): Promise<void> {
-    return new Promise((resolve, reject) => {
-        fs.writeFile(leaderboardCacheFile, JSON.stringify(Leaderboard), {encoding: 'utf-8'}, (err) => {
-            if (err) {
-                reject(err);
-            } else {
-                resolve();
-            }
+async function loadGame(gameID: string): Promise<Game> {
+    const response = await requestWithRetry(`${srcApi}games/${gameID}?embed=categories,variables,levels`, 3);
+    const fullGameVariables: Map<string, Variable> = new Map();
+    const levelVariables: Map<string, Variable> = new Map();
+    const categories: Map<string, Category> = new Map();
+    const levels: Map<string, Level> = new Map();
+    response.data.categories.data
+        .filter((cat: any) => cat.type == "per-game")
+        .forEach((cat: any) => {
+            categories.set(cat.id, {id: cat.id, name: cat.name, variables: new Map()});
         });
-    });
-}
-
-/**
- * Updates the cache file for all category WRs, including subcategories and amiibo
- */
-async function updateCategories(): Promise<Leaderboard[]> {
-    const response = await requestWithRetry(`${srcApi}games/${game}?embed=categories,variables,levels`, 3);
-    const fullGameVariables = [];
-    const levelVariables = [];
-    const categoryList: Category[] = response.data.categories.data
-        .filter(cat => cat.type == "per-game")
-        .map(cat => {
-        return {id: cat.id, name: cat.name, variables: {}};
-    });
     const levelCategories: Category[] = response.data.categories.data
-        .filter(cat => cat.type == "per-level")
-        .map(cat => {
-        return {id: cat.id, name: cat.name, variables: {}};
-    });
-    const levels: Level[] = response.data.levels.data.map(l => {
-        return {
+        .filter((cat: any) => cat.type == "per-level")
+        .map((cat: any): Category => {
+            return {id: cat.id, name: cat.name, variables: new Map()};
+        });
+    response.data.levels.data.map((l: any) => {
+        levels.set(l.id, {
             levelId: l.id,
             levelName: l.name,
             // copy
-            categories: levelCategories.map(cat => {return {id: cat.id, name: cat.name, variables: []}}),
-        };
+            categories: new Map(levelCategories.map(cat => {
+                return [cat.id, {id: cat.id, name: cat.name, variables: new Map()}]
+            })),
+        });
     });
     
-    response.data.variables.data.forEach(variable => {
+    response.data.variables.data.forEach((variable: any) => {
         // only split by subcategories and amiibo
         if (!variable["is-subcategory"] && variable.name != 'amiibo') return;
 
-        let v: Variable = {name: variable.name, id: variable.id, values: {}};
+        let v: Variable = {name: variable.name, id: variable.id, values: new Map()};
         Object.entries(variable.values.values).forEach(([id, val]) => {
-            v.values[id] = (val as any).label;
+            v.values.set(id, (val as any).label);
         });
         if (variable.scope.type == "global") {
             if (variable.category != null) {
-                let cat = categoryList.find(cat => cat.id == variable.category);
+                let cat = categories.get(variable.category);
                 if (cat) {
-                    cat.variables[v.id] = v;
+                    cat.variables.set(v.id, v);
                 }
             } else {
-                categoryList.forEach(cat => {
-                    cat.variables[v.id] = v;
-                });
+                fullGameVariables.set(v.id, v);
             }
         } else if (variable.scope.type == "full-game") {
             if (variable.category != null) {
-                let cat = categoryList.find(cat => cat.id == variable.category);
+                let cat = categories.get(variable.category);
                 if (cat) {
-                    cat.variables[v.id] = v;
+                    cat.variables.set(v.id, v);
                 }
             } else {
-                categoryList.forEach(cat => {
-                    cat.variables[v.id] = v;
-                });
+                fullGameVariables.set(v.id, v);
             }
         } else if (variable.scope.type == "all-levels") {
             if (variable.category != null) {
                 levels.forEach(level => {
-                    let cat = level.categories.find(cat => cat.id == variable.category);
+                    let cat = level.categories.get(variable.category);
                     if (cat) {
-                        cat.variables[v.id] = v;
+                        cat.variables.set(v.id, v);
                     }
                 });
             } else {
-                levels.forEach(level => {
-                    level.categories.forEach(cat => {
-                        cat.variables[v.id] = v;
-                    });
-                });
+                levelVariables.set(v.id, v);
             }
         } else if (variable.scope.type == "single-level") {
-            const level = levels.find(l => l.levelId == variable.scope.level);
-            if (variable.category != null) {
-                let cat = level.categories.find(cat => cat.id == variable.category);
-                if (cat) {
-                    cat.variables[v.id] = v;
+            const level = levels.get(variable.scope.level);
+            if (level) {
+                if (variable.category != null) {
+                    let cat = level.categories.get(variable.category);
+                    if (cat) {
+                        cat.variables.set(v.id, v);
+                    }
+                } else {
+                    level.categories.forEach(cat => {
+                        cat.variables.set(v.id, v);
+                    });
                 }
-            } else {
-                level.categories.forEach(cat => {
-                    cat.variables[v.id] = v;
-                });
             }
         }
     });
-    // a leaderboard for each subcategory
-    const leaderboards: Leaderboard[]= [];
-    categoryList.forEach(cat => {
-        const varCombinations = variableCombinations(cat);
-        varCombinations.forEach(combination => {
-            leaderboards.push({
-                categoryId: cat.id,
-                categoryName: cat.name,
-                levelId: null,
-                levelName: null,
-                variables: combination,
-                wrRunId: null,
-                wrRunTime: null,
-            });
-        })
-    });
-    levels.forEach(level => {
-        level.categories.forEach(cat => {
-            const varCombinations = variableCombinations(cat);
-            varCombinations.forEach(combination => {
-                leaderboards.push({
-                    categoryId: cat.id,
-                    categoryName: cat.name,
-                    levelId: level.levelId,
-                    levelName: level.levelName,
-                    variables: combination,
-                    wrRunId: null,
-                    wrRunTime: null,
-                })
-            })
-        })
-    })
-    // get the current WR for every leaderboard (for every level/category/variable)
-    for(var i = 0;i<leaderboards.length;i++) {
-        const leaderboard = leaderboards[i];
-        const variableQuery = leaderboard.variables.map(variable => `&var-${variable.id}=${variable.valueId}`).join('');
-        let leaderboardData;
-        // differenciate between level and full game run
-        if (leaderboard.levelId == null) {
-            leaderboardData = await requestWithRetry(`${srcApi}leaderboards/${game}/category/${leaderboard.categoryId}?top=1${variableQuery}`, 3);
-        } else {
-            leaderboardData = await requestWithRetry(`${srcApi}leaderboards/${game}/level/${leaderboard.levelId}/${leaderboard.categoryId}?top=1${variableQuery}`, 3);
-        }
-        // if the leaderboard has run(s) cache the current WR
-        if (leaderboardData.data.runs.length) {
-            leaderboard.wrRunId = leaderboardData.data.runs[0].run.id;
-            leaderboard.wrRunTime = leaderboardData.data.runs[0].run.times.primary_t;
-            // need to embed players for this debug log
-            console.log(`${i}/${leaderboards.length} `+formatLeaderboard(leaderboard));
-            //console.log(`The WR in ${formatLeaderboard(leaderboard)} is ${leaderboardData.data.runs[0].run.times.primary} by ${leaderboardData.data.players.data[0].names.international}`);
-        }
-        // don't make too many requests
-        await sleep(1000);
+    return {
+        abbreviation: response.data.abbreviation,
+        name: response.data.names.international,
+        id: gameID,
+        categories,
+        fullGameVariables,
+        levelVariables,
+        levels
     }
-    await saveLeaderboardCache({leaderboards, lastRunIDs: []});
-    return leaderboards;
 }
 
 // no amiibo any% WR: https://www.speedrun.com/api/v1/leaderboards/76rqjqd8/category/vdoq4xvk?top=1&embed=players&var-gnxrr7gn=klr0jj0l
 
-/**
- * Returns the variables for all subcategories, one entry in the array is an array of variables
- * @param cat The category to generate variables out of
- */
-function variableCombinations(cat: Category): ValueVariable[][] {
-    let combinations: ValueVariable[][] = [];
-    const allVariables: ValueVariable[][] = Object.entries(cat.variables).map(([_, variable]) => {
-        return Object.entries(variable.values).map(([valId, value]): ValueVariable => {
-            return {
-                id: variable.id,
-                name: variable.name,
-                valueId: valId,
-                valueName: value,
-            };
-        });
-    });
-    allVariables.forEach((variable, idx) => {
-        if (idx == 0) {
-            combinations = variable.map(vari => [vari]);
-        } else {
-            const oldCombinations = combinations;
-            combinations = [];
-            oldCombinations.forEach(combination => {
-                variable.forEach(value => {
-                    combinations.push(combination.concat([value]));
-                })
-            })
-        }
-    });
-    return combinations;
-}
 
-async function newVerifiedRuns(leaderboardCache: LeaderboardCache): Promise<Run[]> {
-    const runData = await requestWithRetry(`https://www.speedrun.com/api/v1/runs?game=${game}&status=verified&direction=desc&orderby=verify-date&embed=players&max=30`, 3);
+async function newVerifiedRuns(game: Game, lastRunIDs: string[]): Promise<Run[]> {
+    const runData = await requestWithRetry(`https://www.speedrun.com/api/v1/runs?game=${game.id}&status=verified&direction=desc&orderby=verify-date&embed=players&max=30`, 3);
     const newRuns: Run[] = [];
     for(let i = 0;i<runData.data.length;i++) {
         let curRun = runData.data[i];
-        if (!leaderboardCache.lastRunIDs.includes(curRun.id)) {
-            newRuns.push(parseRun(curRun, leaderboardCache.leaderboards));
+        if (!lastRunIDs.includes(curRun.id)) {
+            newRuns.push(parseRun(curRun, game));
         } else {
             break;
         }
@@ -317,69 +208,136 @@ async function newVerifiedRuns(leaderboardCache: LeaderboardCache): Promise<Run[
     return newRuns;
 }
 
-function parseRun(srcData: any, leaderboards: Leaderboard[]): Run {
+function parseRun(srcData: any, game: Game): Run {
     const rawVariables = srcData.values;
-    // grab the right leaderboard
-    let leaderboard: Leaderboard;
-    const filtered = leaderboards
-        .filter(l => {
-            // check category and level, even if it's not an IL run the property exists and is null
-            if (l.categoryId != srcData.category || l.levelId != srcData.level) {
-                return false;
-            } else {
-                // check variables
-                return Object.entries(rawVariables).every(([variableId,valueId]) => {
-                    let matching = l.variables.filter(v => v.id == variableId);
-                    // ignore extra variables that aren't seperating the leaderboard
-                    if (matching.length == 0) {
-                        return true;
-                    }
-                    // if there is a match (multiple should be impossible) check that it's the right value
-                    return matching.every(v => v.valueId == valueId);
-                });
-            }
-        });
-    if (filtered.length != 1) {
-        console.error(`No leaderboard could be found for the run ${srcData.id}`);
-    } else {
-        leaderboard = filtered[0];
-    }
-    return {
+    const gameCategoryVariables: Map<string, Variable> = new Map();
+    const parsedRun: Run = {
+        category: '',
+        categoryID: '',
+        game: game.name,
+        gameID: game.id,
+        gameAbbreviation: game.abbreviation,
         id: srcData.id,
-        leaderboard: leaderboard,
         playerName: srcData.players.data[0].names.international,
+        playerID: srcData.players.data[0].id,
         time: srcData.times.primary_t,
+        level: null,
+        levelID: null,
+        variables: []
+    }
+    if (srcData.level) {
+        game.levelVariables.forEach((vari, id) => {
+            gameCategoryVariables.set(id, vari);
+        });
+        const level = game.levels.get(srcData.level);
+        if (!level) {
+            throw new Error(`Level ${srcData.level} doesn't exist for run ${srcData.id}`);
+        }
+        const category = level.categories.get(srcData.category);
+        if (!category) {
+            throw new Error(`Category ${srcData.category} doesn't exist for run ${srcData.id}`);
+        }
+        category.variables.forEach((vari, id) => {
+            gameCategoryVariables.set(id, vari);
+        });
+        parsedRun.level = level.levelName;
+        parsedRun.levelID = level.levelId;
+        parsedRun.category = category.name;
+        parsedRun.categoryID = category.id;
+    } else {
+        game.fullGameVariables.forEach((vari, id) => {
+            gameCategoryVariables.set(id, vari);
+        });
+        const category = game.categories.get(srcData.category);
+        if (!category) {
+            throw new Error(`Category ${srcData.category} doesn't exist for run ${srcData.id}`);
+        }
+        category.variables.forEach((vari, id) => {
+            gameCategoryVariables.set(id, vari);
+        });
+        parsedRun.category = category.name;
+        parsedRun.categoryID = category.id;
+    }
+    Object.entries(rawVariables).forEach(([variableId,valueId]) => {
+        const vari = gameCategoryVariables.get(variableId);
+        if (vari) {
+            const value = vari.values.get(valueId as string) || '';
+            parsedRun.variables.push({
+                id: vari.id,
+                name: vari.name,
+                valueId: valueId as string,
+                valueName: value
+            });
+        }
+    });
+    return parsedRun;
+}
+
+async function checkRunPlaceOnLeaderboard(run: Run): Promise<number | null> {
+    const varString = run.variables.map(v => `var-${v.id}=${v.valueId}`).join('&');
+    let result;
+    if (run.levelID) {
+        result = await requestWithRetry(`https://www.speedrun.com/api/v1/leaderboards/${run.gameID}/level/${run.levelID}/${run.categoryID}?${varString}`, 3);
+    } else {
+        result = await requestWithRetry(`https://www.speedrun.com/api/v1/leaderboards/${run.gameID}/category/${run.categoryID}?${varString}`, 3);
+    }
+    // try to find the run id
+    const placement = result.data.runs.find((r: any) => r.run.id == run.id);
+    if (placement) {
+        return placement.place;
+    } else {
+        return null;
     }
 }
 
+function formatRun(run: Run): string {
+    let category: string;
+    if (run.level) {
+        category = `${run.level} ${run.category}`;
+    } else {
+        category = run.category;
+    }
+    let subcategories = `${run.variables.map(v => v.valueName).join(', ')}`;
+    return `${category} (${subcategories}) by ${run.playerName} in ${formatTime(run.time)}`;
+}
 
 async function formatSendRun(channel: Discord.TextChannel, info: Run): Promise<any> {
-    let category: string;
-    if (info.leaderboard.levelName) {
-        category = `${info.leaderboard.levelName} ${info.leaderboard.categoryName}`;
-    } else {
-        category = info.leaderboard.categoryName;
-    }
-    let subcategories = `${info.leaderboard.variables.map(v => v.valueName).join(', ')}`
     return channel.send({
         embed: {
             title: `NEW World Record`,
-            url: `https://www.speedrun.com/run/${info.id}`,
+            url: `https://www.speedrun.com/${info.gameAbbreviation}/run/${info.id}`,
             color: 0xffcd2e,
-            description: `A new WR has been posted for ${formatLeaderboard(info.leaderboard)}`,
+            description: `A new WR has been posted for ${formatCategoryWithVars(info)}`,
             fields: [{name: "Runner", value: info.playerName}, {name:"Time", value: formatTime(info.time)}],
         }
     });
 }
 
+async function getAlreadyAnnouncedRunIDs(channel: Discord.TextChannel): Promise<string[]> {
+    let categoryIDs: string[] = [];
+    let fetched = await channel.fetchMessages({limit: 30});
+    fetched.forEach(message => {
+        if (message.embeds.length == 1) {
+            const link = message.embeds[0].url;
+            if (link) {
+                let match = SRC_RUN_LINK_REGEX.exec(link);
+                if (match && match.length == 2) {
+                    categoryIDs.push(match[1]);
+                }
+            }
+        } 
+    });
+    return categoryIDs;
+}
+
 // helpers
 
-function formatLeaderboard(lb: Leaderboard): string {
-    const varString = lb.variables.map(v => v.valueName).join(', ');
-    if (lb.levelId != null) {
-        return `${lb.levelName} ${lb.categoryName} (${varString})`;
+function formatCategoryWithVars(run: Run): string {
+    const varString = run.variables.map(v => v.valueName).join(', ');
+    if (run.levelID != null) {
+        return `${run.level} ${run.category} (${varString})`;
     } else {
-        return `${lb.categoryName} (${varString})`;
+        return `${run.category} (${varString})`;
     }
 }
 
@@ -429,49 +387,44 @@ async function requestWithRetry(url: string, retries: number): Promise<any> {
     throw new Error(`too many retries for url ${url}`);
 }
 
-async function sleep(ms): Promise<void>{
+async function sleep(ms: number): Promise<void>{
     return new Promise(resolve=>{
         setTimeout(resolve,ms)
     })
 }
-
-//updateCategories();
-/*let freeWRs = loadLeaderboardCache()
-    .filter(lb => lb.wrRunId == null)
-    .map(lb => formatLeaderboard(lb));
-console.log(freeWRs);*/
-//console.log(loadLeaderboardCache().length)
-/*wrEmitter.on('newWR', (run: Run) => {
-    console.log('New WR:',run);
-});*/
 /*wrEmitter.on('newRun', (run: Run) => {
     console.log('New run:',run);
 });*/
-srcWRLoop();
 //discordTest();
 
-/*async function discordTest() {
+// example usage
+async function discordTest() {
     const client = new Discord.Client();
-    await client.login("insert token");
-    const channel = client.channels.get("insert id here") as Discord.TextChannel;
-    if (channel) {
-        wrEmitter.on('newWR', async (run: Run) => {
-            console.log('New WR:',run);
-            try {
-                await formatSendRun(channel, run);
-            } catch(e) {
-                console.log('error formatSendRun',e);
-            }
-        });
-    } else {
-        console.error('channel not found!');
-    }
-}*/
+    client.login("your token here");
+    client.on('ready', async () => {
+        const channel = client.channels.get("channel id here") as Discord.TextChannel;
+        if (channel) {
+            const alreadyAnnouncedRunIDs = await getAlreadyAnnouncedRunIDs(channel);
+            console.log(`found ${alreadyAnnouncedRunIDs.length} announced WRs`);
+            srcWRLoop(alreadyAnnouncedRunIDs);
+            wrEmitter.on('newWR', async (run: Run) => {
+                try {
+                    await formatSendRun(channel, run);
+                } catch(e) {
+                    console.log('error formatSendRun',e);
+                }
+            });
+        } else {
+            console.error('channel not found!');
+        }
+    });
+}
 
 module.exports = {
     srcWRLoop,
     wrEmitter,
-    formatLeaderboard,
+    formatCategoryWithVars,
     formatTime,
-    updateCategories,
+    getAlreadyAnnouncedRunIDs,
+    formatSendRun,
 };
